@@ -298,18 +298,22 @@ object Queue {
 
     def unsafeOnQueueEmptySpace(
       queue: MutableConcurrentQueue[A],
-      takers: MutableConcurrentQueue[Promise[Nothing, A]]
+      takers: MutableConcurrentQueue[Promise[Nothing, A]],
+      isRecursiveCall: Boolean = false
     ): Unit
 
     def surplusSize: Int
 
     def shutdown(implicit trace: Trace): UIO[Unit]
 
+    @scala.annotation.tailrec
     final def unsafeCompleteTakers(
       queue: MutableConcurrentQueue[A],
-      takers: MutableConcurrentQueue[Promise[Nothing, A]]
-    ): Unit =
-      if (unsafeCompleteTakersLock.compareAndSet(false, true)) {
+      takers: MutableConcurrentQueue[Promise[Nothing, A]],
+      isRecursiveCall: Boolean = false
+    ): Unit = {
+      val locked = unsafeCompleteTakersLock.compareAndSet(false, true)
+      if (locked || isRecursiveCall) {
         try {
           // check if there is both a taker and an item in the queue, starting by the taker
           var keepPolling = true
@@ -325,15 +329,16 @@ object Queue {
                   unsafeOfferAll(takers, taker +: unsafePollAll(takers))
                 case a =>
                   unsafeCompletePromise(taker, a)
-                  unsafeOnQueueEmptySpace(queue, takers)
+                  unsafeOnQueueEmptySpace(queue, takers, isRecursiveCall = true)
               }
               keepPolling = true
             }
           }
         } finally {
-          unsafeCompleteTakersLock.set(false)
+          if (locked) unsafeCompleteTakersLock.set(false)
         }
-      }
+      } else unsafeCompleteTakers(queue, takers)
+    }
   }
 
   private object Strategy {
@@ -379,11 +384,14 @@ object Queue {
           ()
         }
 
+      @scala.annotation.tailrec
       def unsafeOnQueueEmptySpace(
         queue: MutableConcurrentQueue[A],
-        takers: MutableConcurrentQueue[Promise[Nothing, A]]
-      ): Unit =
-        if (unsafeOnQueueEmptySpaceLock.compareAndSet(false, true)) {
+        takers: MutableConcurrentQueue[Promise[Nothing, A]],
+        isRecursiveCall: Boolean = false
+      ): Unit = {
+        val locked = unsafeOnQueueEmptySpaceLock.compareAndSet(false, true)
+        if (locked || isRecursiveCall) {
           try {
             val empty       = null.asInstanceOf[(A, Promise[Nothing, Boolean], Boolean)]
             var keepPolling = true
@@ -397,13 +405,16 @@ object Queue {
                   unsafeCompletePromise(putter._2, true)
                 else if (!offered)
                   unsafeOfferAll(putters, putter +: unsafePollAll(putters))
-                unsafeCompleteTakers(queue, takers)
+                unsafeCompleteTakers(queue, takers, isRecursiveCall = true)
               }
             }
           } finally {
-            unsafeOnQueueEmptySpaceLock.set(false)
+            if (locked) unsafeOnQueueEmptySpaceLock.set(false)
           }
+        } else {
+          unsafeOnQueueEmptySpace(queue, takers)
         }
+      }
 
       def surplusSize: Int = putters.size()
 
@@ -426,7 +437,8 @@ object Queue {
 
       def unsafeOnQueueEmptySpace(
         queue: MutableConcurrentQueue[A],
-        takers: MutableConcurrentQueue[Promise[Nothing, A]]
+        takers: MutableConcurrentQueue[Promise[Nothing, A]],
+        isRecursiveCall: Boolean = false
       ): Unit = ()
 
       def surplusSize: Int = 0
@@ -467,7 +479,8 @@ object Queue {
 
       def unsafeOnQueueEmptySpace(
         queue: MutableConcurrentQueue[A],
-        takers: MutableConcurrentQueue[Promise[Nothing, A]]
+        takers: MutableConcurrentQueue[Promise[Nothing, A]],
+        isRecursiveCall: Boolean = false
       ): Unit = ()
 
       def surplusSize: Int = 0
