@@ -286,6 +286,9 @@ object Queue {
   }
 
   private sealed abstract class Strategy[A] {
+
+    private val unsafeCompleteTakersLock = new AtomicBoolean(false)
+
     def handleSurplus(
       as: Iterable[A],
       queue: MutableConcurrentQueue[A],
@@ -305,27 +308,32 @@ object Queue {
     final def unsafeCompleteTakers(
       queue: MutableConcurrentQueue[A],
       takers: MutableConcurrentQueue[Promise[Nothing, A]]
-    ): Unit = {
-      // check if there is both a taker and an item in the queue, starting by the taker
-      var keepPolling = true
-      val nullTaker   = null.asInstanceOf[Promise[Nothing, A]]
-      val empty       = null.asInstanceOf[A]
+    ): Unit =
+      if (unsafeCompleteTakersLock.compareAndSet(false, true)) {
+        try {
+          // check if there is both a taker and an item in the queue, starting by the taker
+          var keepPolling = true
+          val nullTaker   = null.asInstanceOf[Promise[Nothing, A]]
+          val empty       = null.asInstanceOf[A]
 
-      while (keepPolling && !queue.isEmpty()) {
-        val taker = takers.poll(nullTaker)
-        if (taker eq nullTaker) keepPolling = false
-        else {
-          queue.poll(empty) match {
-            case null =>
-              unsafeOfferAll(takers, taker +: unsafePollAll(takers))
-            case a =>
-              unsafeCompletePromise(taker, a)
-              unsafeOnQueueEmptySpace(queue, takers)
+          while (keepPolling && !queue.isEmpty()) {
+            val taker = takers.poll(nullTaker)
+            if (taker eq nullTaker) keepPolling = false
+            else {
+              queue.poll(empty) match {
+                case null =>
+                  unsafeOfferAll(takers, taker +: unsafePollAll(takers))
+                case a =>
+                  unsafeCompletePromise(taker, a)
+                  unsafeOnQueueEmptySpace(queue, takers)
+              }
+              keepPolling = true
+            }
           }
-          keepPolling = true
+        } finally {
+          unsafeCompleteTakersLock.set(false)
         }
       }
-    }
   }
 
   private object Strategy {
@@ -334,7 +342,8 @@ object Queue {
       // A is an item to add
       // Promise[Nothing, Boolean] is the promise completing the whole offerAll
       // Boolean indicates if it's the last item to offer (promise should be completed once this item is added)
-      private val putters = MutableConcurrentQueue.unbounded[(A, Promise[Nothing, Boolean], Boolean)]
+      private val putters                     = MutableConcurrentQueue.unbounded[(A, Promise[Nothing, Boolean], Boolean)]
+      private val unsafeOnQueueEmptySpaceLock = new AtomicBoolean(false)
 
       private def unsafeRemove(p: Promise[Nothing, Boolean]): Unit = {
         unsafeOfferAll(putters, unsafePollAll(putters).filterNot(_._2 == p))
