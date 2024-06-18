@@ -373,23 +373,28 @@ object Queue {
       def unsafeOnQueueEmptySpace(
         queue: MutableConcurrentQueue[A],
         takers: MutableConcurrentQueue[Promise[Nothing, A]]
-      ): Unit = {
-        val empty       = null.asInstanceOf[(A, Promise[Nothing, Boolean], Boolean)]
-        var keepPolling = true
+      ): Unit =
+        if (unsafeOnQueueEmptySpaceLock.compareAndSet(false, true)) {
+          try {
+            val empty       = null.asInstanceOf[(A, Promise[Nothing, Boolean], Boolean)]
+            var keepPolling = true
 
-        while (keepPolling && !queue.isFull()) {
-          val putter = putters.poll(empty)
-          if (putter eq null) keepPolling = false
-          else {
-            val offered = queue.offer(putter._1)
-            if (offered && putter._3)
-              unsafeCompletePromise(putter._2, true)
-            else if (!offered)
-              unsafeOfferAll(putters, putter +: unsafePollAll(putters))
-            unsafeCompleteTakers(queue, takers)
+            while (keepPolling && !queue.isFull()) {
+              val putter = putters.poll(empty)
+              if (putter eq null) keepPolling = false
+              else {
+                val offered = queue.offer(putter._1)
+                if (offered && putter._3)
+                  unsafeCompletePromise(putter._2, true)
+                else if (!offered)
+                  unsafeOfferAll(putters, putter +: unsafePollAll(putters))
+                unsafeCompleteTakers(queue, takers)
+              }
+            }
+          } finally {
+            unsafeOnQueueEmptySpaceLock.set(false)
           }
         }
-      }
 
       def surplusSize: Int = putters.size()
 
