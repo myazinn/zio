@@ -2324,7 +2324,13 @@ object ZChannel {
             else
               zio.Queue.unbounded[ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone]]
       q1 <- zio.Queue.bounded[Any](bufferSize)
+      // it's ok to have unbounded queue here; worst case scenario is 2*n size (which is a lot, but not really unbounded)
+      // meanwhile unbounded queue doesn't occupy constant space and seem to just perform better
+      workerPoolCoordinator <- zio.Queue.unbounded[Boolean]
     } yield {
+
+      val tryCreateWorker   = workerPoolCoordinator.offer(true)
+      val tryShutdownWorker = workerPoolCoordinator.offer(false)
 
       lazy val enqueuerCh: ZChannel[Any, OutErr, OutElem, OutDone, OutErr, Nothing, OutDone] =
         ZChannel
@@ -2337,9 +2343,10 @@ object ZChannel {
       lazy val q0Reader
         : ZChannel[Any, Any, Any, Any, Nothing, ZChannel[Any, InErr, InElem, InDone, OutErr, OutElem, OutDone], Any] =
         ZChannel
-          .fromZIO(q0.take)
-          .flatMap { in =>
-            ZChannel.write(in.provideEnvironment(env)) *> q0Reader
+          .fromZIO(q0.poll)
+          .flatMap {
+            case Some(in) => ZChannel.write(in.provideEnvironment(env)) *> q0Reader
+            case None     => ZChannel.fromZIO(tryShutdownWorker)
           }
 
       lazy val nestedStreamsProcessor: ZIO[Any, OutErr, Any] = {
@@ -2356,7 +2363,7 @@ object ZChannel {
         procCh.run
       }
 
-      def upstreamCh(runningFibers: Int, seenStreams: Int): ZChannel[Any, OutErr, ZChannel[
+      def upstreamCh(seenStreams: Int): ZChannel[Any, OutErr, ZChannel[
         Env,
         InErr,
         InElem,
@@ -2366,33 +2373,47 @@ object ZChannel {
         OutDone
       ], OutDone, Nothing, Nothing, Any] =
         ZChannel.readWithCause(
-          in =>
-            ZChannel.fromZIO {
-              val offer = q0.offer(in)
-              if (runningFibers == n)
-                offer.as(n)
-              else if (bounded)
-                offer *> nestedStreamsProcessor.fork.as(runningFibers + 1)
-              else {
-                //when unbounded, we run the risk of spawning a fiber per channel,
-                //even worse, each such fiber may end up processing one or less channels...
-                //in any case these fibers are kept as long as this channel is running which may incur waste of resources.
-                //this attempts to mitigate this by detecting scenarios where an idle worker was able to immediately pick the enqueued message, as a result we get a 'best effort' behavior of limiting the number of fibers.
-                //the unbounded scenario is used by ZStream.groupBy and indeed it requires a fiber per sub-stream,
-                //furthermore in most cases all sub streams 'survive' till processing ends so we're actually required to keep a fiber per stream in this case.
-                offer *> nestedStreamsProcessor.fork.unlessZIO(q0.isEmpty).map {
-                  case Some(_) => runningFibers + 1
-                  case _       => runningFibers
-                }
-              }
-            }.flatMap(upstreamCh(_, seenStreams + 1)),
+          in => ZChannel.fromZIO(q0.offer(in) *> tryCreateWorker.unlessZIO(q0.isEmpty)) *> upstreamCh(seenStreams + 1),
           err => ZChannel.fromZIO(q1.offer(QRes(err))),
           done => ZChannel.fromZIO(q1.offer(QRes(QRes(done -> seenStreams))))
         )
 
+      // when unbounded, we run the risk of spawning a fiber per channel,
+      // even worse, each such fiber may end up processing one or less channels...
+      // this attempts to mitigate this by
+      // 1. detecting scenarios where an idle worker was able to immediately pick the enqueued message, as a result we get a 'best effort' behavior of limiting the number of fibers
+      // 2. shutting down fibers when there is no more work to be done. Once a fiber processes input, it optimistically tries to fetch another value to process.
+      //    if there's nothing to fetch, it stops pulling data and notifies this coordinator which may decide to resurrect it
+      // The coordinator is basically a counter with linearized access to the worker pool,
+      // and is needed to avoid races between spawning workers on element pull and shutting them down on empty queue
+      val coordinatorFiber =
+        ZStream
+          .fromQueueWithShutdown(workerPoolCoordinator)
+          .runFoldScopedZIO(0) { case (runningFibers, requestNewWorker) =>
+            if (requestNewWorker) {
+              if (runningFibers == n)
+                ZIO.succeed(runningFibers)
+              else {
+                // if there's still something in q0, we spawn a new worker to deal with it
+                ZIO.unlessZIO(q0.isEmpty)(nestedStreamsProcessor.fork).map {
+                  case Some(_) => runningFibers + 1
+                  case None    => runningFibers
+                }
+              }
+            } else {
+              // if q0 is truly empty, we can safely let the worker go
+              // otherwise, it's better to resurrect it since the existing workers are not keeping up.
+              ZIO.ifZIO(q0.isEmpty)(
+                onTrue = ZIO.succeed(runningFibers - 1),
+                onFalse = nestedStreamsProcessor.fork.as(runningFibers)
+              )
+            }
+          }
+          .forkScoped
+
       val upstreamFiber: ZIO[Any with Scope, Nothing, Fiber.Runtime[Nothing, Any]] = queueReader
         .pipeTo(channels.provideEnvironment(env))
-        .pipeTo(upstreamCh(0, 0))
+        .pipeTo(upstreamCh(0))
         .runScoped
         .forkScoped
 
@@ -2434,7 +2455,7 @@ object ZChannel {
           }
 
       val resChannel: ZChannel[Any, InErr, InElem, InDone, OutErr, OutElem, OutDone] = ZChannel
-        .scoped[Any](upstreamFiber)
+        .scoped[Any](coordinatorFiber *> upstreamFiber)
         .concatMapWith { fib =>
           val reader: ZChannel[Any, Any, Any, Any, OutErr, OutElem, OutDone] =
             readerCh(-1, 0, null.asInstanceOf[OutDone])
